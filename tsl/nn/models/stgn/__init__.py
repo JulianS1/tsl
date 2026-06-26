@@ -4,6 +4,7 @@ from .evolve_gcn_model import EvolveGCNModel
 from .gated_gn_model import GatedGraphNetworkModel
 from .graph_wavenet_model import GraphWaveNetModel
 from .grin_model import GRINModel
+from .gru_diffconv_model import GRUDiffConvModel
 from .gru_gcn_model import GRUGCNModel
 from .rnn_gcn_model import RNNEncGCNDecModel
 from .spin_model import SPINHierarchicalModel, SPINModel
@@ -16,6 +17,7 @@ __all__ = [
     'RNNEncGCNDecModel',
     'STCNModel',
     'EvolveGCNModel',
+    'GRUDiffConvModel',
     'GRUGCNModel',
     'AGCRNModel',
     'GRINModel',
