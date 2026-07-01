@@ -19,8 +19,8 @@ grid = ExperimentGrid(
 
     # These are the same for every run
     fixed={
-        'epochs': 20,
-        'patience': 30,
+        'epochs': 50,
+        'patience': 10,
         'window': 12,
         'horizon': 12,
         'batch_size': 64

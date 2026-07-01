@@ -18,7 +18,7 @@ class GRUDiffConvModel(BaseModel):
         super().__init__()
         in_ch = input_size + exog_size
         self.gru = nn.GRU(in_ch, hidden_size, batch_first=True)
-        self.edge_scaler = EdgeScaler(window_size * in_ch, hidden_size,
+        self.edge_scaler = EdgeScaler(window_size, in_ch, hidden_size,
                                       scaling_mode=edge_mode)
         self.diffconv = DiffConv(hidden_size, hidden_size, k=1)
         self.readout = nn.Linear(hidden_size, horizon * output_size)
@@ -31,19 +31,19 @@ class GRUDiffConvModel(BaseModel):
         x = utils.maybe_cat_exog(x, u)
         B, T, N, F = x.shape
 
-        # 1. Compute modulated edge weights from the input window
-        scaled_w = self.edge_scaler.scale(x, edge_index, edge_weight)  # (E,)
+        #Compute modulated edge weights from the input window
+        scaled_w = self.edge_scaler.scale(x, edge_index, edge_weight)
 
-        # 2. GRU over time, per node
+        #GRU
         x_in = rearrange(x, 'b t n f -> (b n) t f')
         h, _ = self.gru(x_in)                              # (B*N, T, hidden)
-        h = h[:, -1, :]                                    # (B*N, hidden)
-        h = rearrange(h, '(b n) d -> b n d', b=B, n=N)    # (B, N, hidden)
+        h = h[:, -1, :]
+        h = rearrange(h, '(b n) d -> b n d', b=B, n=N)
 
-        # 3. DiffConv with dynamically scaled edge weights
-        out = self.diffconv(h, edge_index, scaled_w)       # (B, N, hidden)
+        #DiffConv with scaled edge weights
+        out = self.diffconv(h, edge_index, scaled_w)
 
-        # 4. Readout to forecast horizon
+        #Readout to forecast horizon
         out = self.readout(out)                            # (B, N, horizon * output_size)
         return rearrange(out, 'b n (h f) -> b h n f',
                          h=self._horizon, f=self._output_size)
