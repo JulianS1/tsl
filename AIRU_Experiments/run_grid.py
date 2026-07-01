@@ -13,7 +13,8 @@ grid = ExperimentGrid(
     # Every combination of these values will be run
     hparams={
         'lr': [0.001],
-        'hidden_size': [32, 64],
+        'hidden_size': [64],
+        'scaling_mode': ['fixed', 'uniform', 'linear', 'mlp', 'tcn'],
     },
 
     # These are the same for every run
@@ -25,6 +26,8 @@ grid = ExperimentGrid(
         'batch_size': 64
     },
 
+    seeds=[42, 123, 456],
+
     skip_errors=True,  # log failures and continue rather than crashing
 )
 
@@ -32,14 +35,13 @@ grid = ExperimentGrid(
 if __name__ == '__main__':
     results = grid.run(results_file='results/grid_results.csv')
 
-    # Print a clean summary table
-    df = ExperimentGrid.load_results('results/grid_results.csv')
-    ok = df[df['status'] == 'ok']
-    if not ok.empty:
-        summary_cols = ['dataset', 'model', 'lr', 'hidden_size',
-                        'test_mae', 'test_rmse', 'test_mape']
-        summary_cols = [c for c in summary_cols if c in ok.columns]
+    #To print mean ± std across seeds
+    summary = ExperimentGrid.summarize('results/grid_results.csv')
+    summary_cols = ['dataset', 'model', 'scaling_mode', 'hidden_size',
+                    'test_mae', 'test_mae_at_15', 'test_mae_at_30', 'test_mae_at_60']
+    summary_cols = [c for c in summary_cols if c in summary.columns]
+    if not summary.empty:
         print("\n" + "=" * 70)
-        print("Results summary")
+        print("Results summary (mean ± std across seeds)")
         print("=" * 70)
-        print(ok[summary_cols].sort_values('test_mae').to_string(index=False))
+        print(summary[summary_cols].to_string(index=False))

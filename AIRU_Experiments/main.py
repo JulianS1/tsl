@@ -1,20 +1,22 @@
 import argparse
+import random
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+
 
 from tsl import logger
 from tsl.data import SpatioTemporalDataModule, SpatioTemporalDataset
 from tsl.data.preprocessing import StandardScaler
 from tsl.engines import Predictor
-from tsl.metrics import numpy as numpy_metrics
 from tsl.metrics import torch as torch_metrics
-from tsl.utils.casting import torch_to_numpy
 
 from AIRU_Experiments.setup import Setup
 
@@ -49,13 +51,10 @@ def resolve_accelerator(requested: str) -> str:
         if requested == 'gpu':
             logger.warning("GPU requested but CUDA is not available; using CPU.")
         return 'cpu'
-    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    sm_tag = f"sm_{major}{minor}"
-    if sm_tag not in torch.cuda.get_arch_list():
-        logger.warning(
-            f"GPU '{torch.cuda.get_device_name()}' ({sm_tag}) is not supported "
-            f"by this PyTorch build. Falling back to CPU."
-        )
+    try:
+        torch.ones(1).cuda()
+    except RuntimeError as e:
+        logger.warning(f"GPU unusable ({e}); falling back to CPU.")
         return 'cpu'
     return 'gpu'
 
@@ -94,7 +93,6 @@ def parse_args():
     p.add_argument('--results-file', default=None,
                    help='CSV file to append results to (optional).')
 
-    # Model hyperparameters — unused ones are stripped by filter_model_args_
     p.add_argument('--hidden-size', type=int, default=32)
     p.add_argument('--ff-size', type=int, default=256)
     p.add_argument('--n-layers', type=int, default=8)
@@ -112,6 +110,12 @@ def parse_args():
 def run_experiment(args):
     """Run a single experiment. Returns a dict of val/test metrics."""
 
+    seed = getattr(args, 'seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     setup = Setup(args)
 
     # Dataset & adjacency matrix
@@ -123,16 +127,12 @@ def run_experiment(args):
                                layout=args.connectivity_layout)
     adj = dataset.get_connectivity(**connectivity_kwargs)
 
-    # Covariates (time-of-day sine/cosine encoding)
     covariates = {}
     try:
         covariates['u'] = dataset.datetime_encoded('day').values
     except Exception:
-        pass  # dataset has no datetime index
+        pass 
 
-    # -------------------------------------------------------------------------
-    # SpatioTemporalDataset
-    # -------------------------------------------------------------------------
     torch_dataset = SpatioTemporalDataset(
         target=dataset.dataframe(),
         mask=dataset.mask if dataset.has_mask else None,
@@ -155,17 +155,15 @@ def run_experiment(args):
     )
     dm.setup()
 
-    # Model & predictor
     model_cls = setup.get_model(args.model)
 
     exog_size = (torch_dataset.input_map.u.shape[-1]
                  if 'u' in torch_dataset.input_map else 0)
 
-    # Start with data-derived sizes, then add all model hparams.
-    # filter_model_args_ removes any that the chosen model doesn't accept.
     model_kwargs = dict(
         n_nodes=torch_dataset.n_nodes,
         input_size=torch_dataset.n_channels,
+        window_size=args.window,
         output_size=torch_dataset.n_channels,
         horizon=torch_dataset.horizon,
         exog_size=exog_size,
@@ -179,6 +177,7 @@ def run_experiment(args):
         dilation=args.dilation,
         dilation_mod=args.dilation_mod,
         norm=args.norm,
+        edge_mode=getattr(args, 'scaling_mode', 'fixed'),
     )
     model_cls.filter_model_args_(model_kwargs)
 
@@ -223,11 +222,13 @@ def run_experiment(args):
         torch.set_float32_matmul_precision('high')
 
     exp_logger = setup.get_logger(args.logger_backend)
+    csv_logger = CSVLogger(save_dir=args.log_dir, name='', version='')
+    loggers = [csv_logger] + ([exp_logger] if exp_logger else [])
 
     trainer = Trainer(
         max_epochs=args.epochs,
         default_root_dir=args.log_dir,
-        logger=exp_logger,
+        logger=loggers,
         accelerator=accelerator,
         devices=1,
         gradient_clip_val=args.grad_clip,
@@ -236,25 +237,18 @@ def run_experiment(args):
 
     trainer.fit(predictor, datamodule=dm)
 
-    #Test on best model checkpoint
+    # Evaluate best checkpoint — trainer.test/validate return the full metric dict
     predictor.load_model(callbacks[1].best_model_path)
     predictor.freeze()
-    trainer.test(predictor, datamodule=dm)
+    test_out = trainer.test(predictor, datamodule=dm)[0]
+    val_out  = trainer.validate(predictor, datamodule=dm)[0]
 
-    def evaluate(dataloader, split):
-        out = trainer.predict(predictor, dataloaders=dataloader)
-        out = predictor.collate_prediction_outputs(out)
-        out = torch_to_numpy(out)
-        y_hat, y_true, mask = out['y_hat'], out['y'], out.get('mask')
-        return {
-            f'{split}_mae':  numpy_metrics.mae(y_hat, y_true, mask),
-            f'{split}_rmse': numpy_metrics.rmse(y_hat, y_true, mask),
-            f'{split}_mape': numpy_metrics.mape(y_hat, y_true, mask),
-        }
-
-    res = {}
-    res.update(evaluate(dm.val_dataloader(), 'val'))
-    res.update(evaluate(dm.test_dataloader(), 'test'))
+    res = {**val_out, **test_out}
+    # Derive RMSE from MSE (Lightning logs MSE, not RMSE)
+    for prefix in ('val', 'test'):
+        mse_key = f'{prefix}_mse'
+        if mse_key in res:
+            res[f'{prefix}_rmse'] = res[mse_key] ** 0.5
 
     logger.info("=" * 50)
     for k, v in res.items():

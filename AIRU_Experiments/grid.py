@@ -1,19 +1,22 @@
 import csv
 import itertools
 import sys
+import pandas as pd
 from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
+from AIRU_Experiments.main import run_experiment
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Defaults mirror parse_args() and match the GWN paper baseline (Wu et al., IJCAI 2019).
 DEFAULTS = {
     'connectivity_layout': 'edge_index',
+    'scaling_mode': 'fixed',
     'window': 12,
     'horizon': 12,
     'stride': 1,
-    'epochs': 100,
+    'epochs': 1,
     'batch_size': 64,
     'lr': 0.001,
     'lr_decay': 0.97,
@@ -42,10 +45,18 @@ DEFAULTS = {
 def _append_to_csv(row: dict, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
+    # Read existing header so new columns can be appended consistently
+    if path.exists():
+        with open(path, newline='') as f:
+            existing_fields = next(csv.reader(f))
+    else:
+        existing_fields = []
+    # Union: keep existing order, append any new keys
+    fields = existing_fields + [k for k in row if k not in existing_fields]
     with open(path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
+        writer = csv.DictWriter(f, fieldnames=fields, restval='',
+                                quoting=csv.QUOTE_NONNUMERIC)
+        if not existing_fields:
             writer.writeheader()
         writer.writerow(row)
 
@@ -77,15 +88,16 @@ class ExperimentGrid:
     """
 
     def __init__(self, datasets, models, hparams=None, fixed=None,
-                 skip_errors=True):
+                 seeds=None, skip_errors=True):
         self.datasets = datasets
         self.models = models
         self.hparams = hparams or {}
         self.fixed = fixed or {}
+        self.seeds = seeds if seeds is not None else [42]
         self.skip_errors = skip_errors
 
     def _configs(self):
-        """Yield one config dict per experiment."""
+        """Yield one config dict per experiment (hparam combo × seed)."""
         hparam_names = list(self.hparams.keys())
         hparam_values = list(self.hparams.values())
         combos = list(itertools.product(*hparam_values)) if hparam_values else [()]
@@ -93,13 +105,15 @@ class ExperimentGrid:
         for dataset in self.datasets:
             for model in self.models:
                 for combo in combos:
-                    cfg = dict(DEFAULTS)
-                    cfg.update(self.fixed)
-                    cfg['dataset'] = dataset
-                    cfg['model'] = model
-                    for name, value in zip(hparam_names, combo):
-                        cfg[name] = value
-                    yield cfg
+                    for seed in self.seeds:
+                        cfg = dict(DEFAULTS)
+                        cfg.update(self.fixed)
+                        cfg['dataset'] = dataset
+                        cfg['model'] = model
+                        cfg['seed'] = seed
+                        for name, value in zip(hparam_names, combo):
+                            cfg[name] = value
+                        yield cfg
 
     def run(self, results_file='results/grid_results.csv'):
         """Run all experiments and save results to a CSV.
@@ -112,7 +126,7 @@ class ExperimentGrid:
         Returns:
             List of result dicts (one per completed experiment).
         """
-        from AIRU_Experiments.main import run_experiment
+        
 
         configs = list(self._configs())
         total = len(configs)
@@ -122,7 +136,9 @@ class ExperimentGrid:
 
         for i, cfg in enumerate(configs, 1):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            cfg['log_dir'] = f"logs/{cfg['model']}/{cfg['dataset']}/{timestamp}"
+            hparam_tag = "_".join(f"{k}={cfg[k]}" for k in self.hparams)
+            cfg['log_dir'] = (f"logs/{cfg['model']}/{cfg['dataset']}/{timestamp}"
+                              f"/{hparam_tag}/seed={cfg['seed']}")
 
             print(f"\n[{i}/{total}] {cfg['model']} | {cfg['dataset']} | "
                   + " | ".join(f"{k}={v}" for k, v in self.hparams.items()
@@ -149,18 +165,41 @@ class ExperimentGrid:
 
     @staticmethod
     def load_results(results_file='results/grid_results.csv'):
-        """Load results CSV as a pandas DataFrame.
-
-        Usage::
-
-            df = ExperimentGrid.load_results('results/my_grid.csv')
-            print(df[['dataset', 'model', 'lr', 'test_mae', 'test_rmse']].to_string())
-        """
-        import pandas as pd
+        """Load results CSV as a pandas DataFrame."""
         df = pd.read_csv(results_file)
-        # Put identifier columns first for readability
         id_cols = ['dataset', 'model', 'status', 'timestamp']
         metric_cols = [c for c in df.columns if c.startswith(('val_', 'test_'))]
         other_cols = [c for c in df.columns
                       if c not in id_cols and c not in metric_cols]
         return df[id_cols + metric_cols + other_cols]
+
+    @staticmethod
+    def summarize(results_file='results/grid_results.csv', metric_cols=None):
+        """Aggregate results across seeds, returning mean ± std per hparam combo.
+
+        Usage::
+
+            df = ExperimentGrid.summarize('results/my_grid.csv')
+            print(df.to_string(index=False))
+        """
+        df = ExperimentGrid.load_results(results_file)
+        ok = df[df['status'] == 'ok'].copy()
+
+        if metric_cols is None:
+            metric_cols = [c for c in ok.columns if c.startswith(('val_', 'test_'))]
+
+        non_group = {'seed', 'timestamp', 'status', 'log_dir'} | set(metric_cols)
+        group_keys = [c for c in ok.columns if c not in non_group]
+
+        numeric_metrics = [c for c in metric_cols
+                           if pd.api.types.is_numeric_dtype(ok[c])]
+        grouped = ok.groupby(group_keys, sort=False)[numeric_metrics]
+        mean = grouped.mean()
+        std = grouped.std(ddof=1).fillna(0)
+
+        summary = mean.copy()
+        for col in numeric_metrics:
+            summary[col] = [f'{m:.4f} ± {s:.4f}'
+                            for m, s in zip(mean[col], std[col])]
+
+        return summary.reset_index()

@@ -6,6 +6,7 @@ from pytorch_lightning.loggers import Logger, TensorBoardLogger
 from tsl.datasets import MetrLA, PemsBay, GPVARDatasetAZ
 from tsl.datasets.pems_benchmarks import PeMS03, PeMS04, PeMS07, PeMS08
 from tsl.nn import models
+from test_model import GRUDiffConvModel
 
 try:
     from pytorch_lightning.loggers import WandbLogger
@@ -40,7 +41,7 @@ class Setup:
         elif model_str == 'dcrnn':
             model = models.DCRNNModel
         elif model_str == 'gru_diffconv':
-            model = models.GRUDiffConvModel
+            model = GRUDiffConvModel
         else:
             raise NotImplementedError(f'Model "{model_str}" not available.')
         return model
